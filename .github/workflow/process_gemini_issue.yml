@@ -1,0 +1,98 @@
+name: Process New Issue with Gemini
+
+on:
+  issues:
+    types: [opened] # Triggers when a new issue is opened
+  workflow_dispatch: # Allows manual triggering for testing
+
+jobs:
+  run_gemini_on_issue:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read # To read the issue body
+      contents: write # To commit the output file back to the repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4 # Use the latest version
+
+      - name: Set up Python
+        uses: actions/setup-python@v5 # Use the latest version
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-generativeai
+
+      - name: Run Gemini on Issue Body
+        id: gemini_script # Give an ID to this step to access its outputs
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          import os
+          import google.generativeai as genai # Use 'genai' alias as per your example
+
+          api_key = os.environ.get("GEMINI_API_KEY")
+          issue_body_text = os.environ.get("ISSUE_BODY")
+          issue_number = os.environ.get("ISSUE_NUMBER")
+
+          output_filename = f"gemini_output_issue_{issue_number}.txt"
+
+          print(f"Processing Issue #{issue_number}")
+          print(f"Issue Body: {issue_body_text[:100]}...") # Print first 100 chars for logging
+
+          if not api_key:
+              print("Error: GEMINI_API_KEY not found.")
+              exit(1)
+          if not issue_body_text:
+              print("Error: Issue body is empty.")
+              # Decide how to handle: exit or create empty output?
+              # For now, let's create an empty output with a message
+              with open(output_filename, "w", encoding="utf-8") as f:
+                  f.write("Error: Issue body was empty. No content sent to Gemini.")
+              print(f"::set-output name=output_file::{output_filename}") # Set output for next step
+              exit(0) # Exit successfully as we handled the empty body case
+
+          try:
+              # Corrected Gemini API call based on your example
+              genai.configure(api_key=api_key) # Configure the client with the key
+              model = genai.GenerativeModel(model_name="gemini-2.5-flash-preview-05-20") # Or your preferred model like "gemini-pro"
+              
+              print(f"Sending to Gemini: {issue_body_text}")
+              response = model.generate_content(issue_body_text)
+              gemini_text_output = response.text
+
+          except Exception as e:
+              print(f"Error calling Gemini API: {e}")
+              gemini_text_output = f"Error during Gemini API call: {str(e)}"
+
+          print(f"Gemini Output: {gemini_text_output[:100]}...")
+
+          # Save output to a .txt file
+          with open(output_filename, "w", encoding="utf-8") as f:
+              f.write(gemini_text_output)
+          
+          print(f"Output saved to {output_filename}")
+          
+          # Set the output filename for the next step
+          print(f"::set-output name=output_file::{output_filename}")
+
+      - name: Commit and Push Output File
+        if: steps.gemini_script.outputs.output_file != '' # Only run if an output file was generated
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add ${{ steps.gemini_script.outputs.output_file }}
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add Gemini output for Issue #${{ github.event.issue.number }}"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Provided by GitHub Actions

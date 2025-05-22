@@ -1,4 +1,4 @@
-name: Process New Issue with Gemini and Upload to OneDrive
+name: Process New Issue with Gemini and Upload to OneDrive (Manual API)
 
 on:
   issues:
@@ -9,20 +9,21 @@ jobs:
   run_gemini_and_upload_to_onedrive:
     runs-on: ubuntu-latest
     permissions:
-      issues: read # Still need to read the issue body
-      # contents: write # No longer needed as we are not committing to the repo
+      issues: read # To read the issue body
 
-    env: # Environment variables available to all steps in this job
+    env:
       # OneDrive Secrets - ensure these are set in your repository secrets
       MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
       MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
       MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
       MS_USER_PRINCIPAL_NAME: ${{ secrets.MS_USER_PRINCIPAL_NAME }} # User whose OneDrive to use
-      ONEDRIVE_GEMINI_FOLDER: '/gemini_output' # Target folder in OneDrive, starts with '/' for root
+      # Define just the target folder name. Path construction will handle the rest.
+      # The API call will place it under the 'root' of the drive.
+      ONEDRIVE_TARGET_FOLDER_NAME: 'gemini_output'
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4 # Good practice, though not strictly needed if script is fully self-contained
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,7 +36,7 @@ jobs:
           pip install google-generativeai
 
       - name: Run Gemini on Issue Body
-        id: gemini_script # We still need the output_file from this script
+        id: gemini_script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ISSUE_BODY: ${{ github.event.issue.body }}
@@ -49,11 +50,11 @@ jobs:
           issue_body_text = os.environ.get("ISSUE_BODY", "") # Default to empty string
           issue_number = os.environ.get("ISSUE_NUMBER")
 
+          # Corrected f-string syntax here
           output_filename = f"gemini_output_issue_{issue_number}.txt"
 
           print(f"Processing Issue #{issue_number}")
           print(f"Output filename will be: {output_filename}")
-          print(f"Issue Body (first 100 chars): {issue_body_text[:100]}")
 
           if not api_key:
               print("Error: GEMINI_API_KEY not found.")
@@ -62,18 +63,17 @@ jobs:
                   print(f'output_file=', file=fh)
               exit(1) # Fail the step if API key is missing
 
-          # Prepare content for the file, whether it's an error or Gemini output
           file_content_to_write = ""
-
           if not issue_body_text.strip():
               print("Warning: Issue body is empty or only whitespace.")
               file_content_to_write = "Error: Issue body was empty. No content sent to Gemini."
           else:
               try:
                   genai.configure(api_key=api_key)
-                  model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest") # Updated to a common flash model
+                  # Using a common flash model. Adjust if needed.
+                  model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest")
                   
-                  print(f"Sending to Gemini: '{issue_body_text}'")
+                  print(f"Sending to Gemini (first 100 chars): '{issue_body_text[:100]}'")
                   response = model.generate_content(issue_body_text)
                   
                   if hasattr(response, 'text') and response.text is not None:
@@ -83,8 +83,9 @@ jobs:
                   else:
                       error_message = "Error: Could not extract text from Gemini response."
                       print(error_message)
-                      print("Full response:", response) # Log the full response for debugging
-                      file_content_to_write = error_message + "\nFull response:\n" + str(response)
+                      # Log the full response for debugging if possible
+                      # print("Full response:", response)
+                      file_content_to_write = error_message + "\nFull response logged to actions console if possible."
 
               except Exception as e:
                   print(f"Error calling Gemini API: {e}")
@@ -92,33 +93,96 @@ jobs:
           
           print(f"Content for file (first 100 chars): {file_content_to_write[:100]}")
 
-          # Always write the file, even if it's an error message
           with open(output_filename, "w", encoding="utf-8") as f:
               f.write(file_content_to_write)
           
           print(f"Content saved to local file: {output_filename}")
           
-          # Set the output filename for the next step
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
               print(f'output_file={output_filename}', file=fh)
           EOF
-
           python gemini_processor.py
 
-      - name: Upload Gemini Output to OneDrive
-        # Only run if the python script actually produced an output_file name
-        if: steps.gemini_script.outputs.output_file != ''
-        uses: jef/ms-graph-upload-action@v2.0.0
-        with:
-          CLIENT_ID: ${{ env.MS_CLIENT_ID }}
-          CLIENT_SECRET: ${{ env.MS_CLIENT_SECRET }}
-          TENANT_ID: ${{ env.MS_TENANT_ID }}
-          USER_PRINCIPAL_NAME: ${{ env.MS_USER_PRINCIPAL_NAME }}
-          TARGET_FOLDER: ${{ env.ONEDRIVE_GEMINI_FOLDER }} # e.g. /gemini_output
-          FILE_PATH: ${{ steps.gemini_script.outputs.output_file }} # The file generated by python script
-          CONFLICT_BEHAVIOR: 'replace' # Options: 'replace', 'rename', 'fail' (default)
-          # RENAME_FILE: # Optional: if you want to rename it on OneDrive, otherwise uses original name
+      - name: Upload Gemini Output to OneDrive via MS Graph API
+        # Only run if the python script produced an output_file and secrets are present
+        if: steps.gemini_script.outputs.output_file != '' && env.MS_CLIENT_ID != '' && env.MS_CLIENT_SECRET != '' && env.MS_TENANT_ID != '' && env.MS_USER_PRINCIPAL_NAME != ''
+        env:
+          LOCAL_FILE_TO_UPLOAD: ${{ steps.gemini_script.outputs.output_file }}
+        run: |
+          echo "Attempting to upload '$LOCAL_FILE_TO_UPLOAD' to OneDrive folder '$ONEDRIVE_TARGET_FOLDER_NAME'"
 
-      # The "Commit and Push Output File" step has been removed
-      # - name: Commit and Push Output File
-      #   ...
+          if [ ! -f "$LOCAL_FILE_TO_UPLOAD" ]; then
+            echo "Error: File '$LOCAL_FILE_TO_UPLOAD' not found for upload."
+            exit 1
+          fi
+
+          # Step 1: Acquire Access Token from Microsoft Identity Platform
+          echo "Acquiring Access Token..."
+          TOKEN_RESPONSE=$(curl -s -X POST "https://login.microsoftonline.com/$MS_TENANT_ID/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=$MS_CLIENT_ID" \
+            -d "client_secret=$MS_CLIENT_SECRET" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            -d "grant_type=client_credentials")
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
+
+          if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Error: Failed to acquire Access Token."
+            echo "Token Response: $TOKEN_RESPONSE"
+            exit 1
+          fi
+          echo "Access Token acquired successfully."
+
+          # Step 2: Construct the Upload URL
+          # Path segment for the folder. If ONEDRIVE_TARGET_FOLDER_NAME is empty, it uploads to drive root.
+          # Otherwise, it uploads to /root:/folder_name/filename.txt
+          # The API requires the item path to start with 'root:' if addressing by path from the root.
+          # For example: /users/{upn}/drive/root:/MyFolder/MyFile.txt:/content
+          
+          FILENAME_ONLY=$(basename "$LOCAL_FILE_TO_UPLOAD")
+          
+          # URL encode the filename (e.g., spaces to %20) - Python is already available
+          ENCODED_FILENAME=$(python -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "$FILENAME_ONLY")
+
+          # Construct path: if folder name is empty, target root. Otherwise, target folder in root.
+          if [ -z "$ONEDRIVE_TARGET_FOLDER_NAME" ]; then
+            # Upload to drive root
+            UPLOAD_API_PATH="root:/$ENCODED_FILENAME"
+          else
+            # Clean potential leading/trailing slashes from folder name for robust path construction
+            CLEANED_FOLDER_NAME=$(echo "$ONEDRIVE_TARGET_FOLDER_NAME" | sed 's#^/*##;s#/*$##')
+            UPLOAD_API_PATH="root:/$CLEANED_FOLDER_NAME/$ENCODED_FILENAME"
+          fi
+          
+          UPLOAD_URL="https://graph.microsoft.com/v1.0/users/$MS_USER_PRINCIPAL_NAME/drive/$UPLOAD_API_PATH:/content"
+          
+          echo "Upload URL: $UPLOAD_URL"
+
+          # Step 3: Upload the file using PUT request
+          echo "Uploading '$LOCAL_FILE_TO_UPLOAD' to OneDrive..."
+          # The --data-binary "@filename" reads the content from the file.
+          # -w "%{http_code}" writes the HTTP status code to stdout
+          # -o upload_api_response.txt saves the body of the API response to a file
+          HTTP_STATUS_CODE=$(curl -s -L -X PUT "$UPLOAD_URL" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary "@$LOCAL_FILE_TO_UPLOAD" \
+            -w "%{http_code}" -o upload_api_response.txt)
+          
+          API_RESPONSE_BODY=$(cat upload_api_response.txt)
+
+          if [ "$HTTP_STATUS_CODE" -ge 200 ] && [ "$HTTP_STATUS_CODE" -lt 300 ]; then
+            echo "File uploaded successfully to OneDrive. Status: $HTTP_STATUS_CODE"
+            echo "OneDrive API Response: $API_RESPONSE_BODY"
+          else
+            echo "Error: Failed to upload file to OneDrive. HTTP Status: $HTTP_STATUS_CODE"
+            echo "OneDrive API Response: $API_RESPONSE_BODY"
+            # For 401/403, it's often a permission or token issue.
+            if [ "$HTTP_STATUS_CODE" == "401" ] || [ "$HTTP_STATUS_CODE" == "403" ]; then
+                echo "Check Azure AD App permissions (e.g., Files.ReadWrite.All) and token generation."
+            elif [ "$HTTP_STATUS_CODE" == "404" ]; then
+                echo "Check if the UPN ($MS_USER_PRINCIPAL_NAME) is correct or if the drive/folder path is valid."
+            fi
+            exit 1
+          fi

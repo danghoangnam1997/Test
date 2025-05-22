@@ -44,7 +44,6 @@ jobs:
 
           print(f"Processing Issue #{issue_number}")
           print(f"Issue Body: {issue_body_text[:100]}...") # Print first 100 chars for logging
-          "
 
           if not api_key:
               print("Error: GEMINI_API_KEY not found.")
@@ -81,6 +80,7 @@ jobs:
           
           # Set the output filename for the next step
           print(f"::set-output name=output_file::{output_filename}")
+          "
 
       - name: Commit and Push Output File
         if: steps.gemini_script.outputs.output_file != '' # Only run if an output file was generated

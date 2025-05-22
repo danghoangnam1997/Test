@@ -1,4 +1,4 @@
-name: Process New Issue with Gemini
+name: Process New Issue with Gemini and Upload to OneDrive
 
 on:
   issues:
@@ -6,20 +6,28 @@ on:
   workflow_dispatch:
 
 jobs:
-  run_gemini_on_issue:
+  run_gemini_and_upload_to_onedrive:
     runs-on: ubuntu-latest
     permissions:
-      issues: read
-      contents: write
+      issues: read # Still need to read the issue body
+      # contents: write # No longer needed as we are not committing to the repo
+
+    env: # Environment variables available to all steps in this job
+      # OneDrive Secrets - ensure these are set in your repository secrets
+      MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+      MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+      MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+      MS_USER_PRINCIPAL_NAME: ${{ secrets.MS_USER_PRINCIPAL_NAME }} # User whose OneDrive to use
+      ONEDRIVE_GEMINI_FOLDER: '/gemini_output' # Target folder in OneDrive, starts with '/' for root
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4 # Good practice, though not strictly needed if script is fully self-contained
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x' # Ensure it's a version that supports f-strings well, 3.7+ is good
+          python-version: '3.x'
 
       - name: Install dependencies
         run: |
@@ -27,7 +35,7 @@ jobs:
           pip install google-generativeai
 
       - name: Run Gemini on Issue Body
-        id: gemini_script
+        id: gemini_script # We still need the output_file from this script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ISSUE_BODY: ${{ github.event.issue.body }}
@@ -41,7 +49,6 @@ jobs:
           issue_body_text = os.environ.get("ISSUE_BODY", "") # Default to empty string
           issue_number = os.environ.get("ISSUE_NUMBER")
 
-          # Corrected f-string syntax here
           output_filename = f"gemini_output_issue_{issue_number}.txt"
 
           print(f"Processing Issue #{issue_number}")
@@ -50,57 +57,46 @@ jobs:
 
           if not api_key:
               print("Error: GEMINI_API_KEY not found.")
-              # Write empty output_file to GITHUB_OUTPUT to signal no file to commit
+              # Write empty output_file to GITHUB_OUTPUT to signal no file to process
               with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
                   print(f'output_file=', file=fh)
-              exit(1)
+              exit(1) # Fail the step if API key is missing
+
+          # Prepare content for the file, whether it's an error or Gemini output
+          file_content_to_write = ""
 
           if not issue_body_text.strip():
               print("Warning: Issue body is empty or only whitespace.")
-              with open(output_filename, "w", encoding="utf-8") as f:
-                  f.write("Error: Issue body was empty. No content sent to Gemini.")
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-                  print(f'output_file={output_filename}', file=fh)
-              exit(0) # Successful exit as it's a handled scenario
+              file_content_to_write = "Error: Issue body was empty. No content sent to Gemini."
+          else:
+              try:
+                  genai.configure(api_key=api_key)
+                  model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest") # Updated to a common flash model
+                  
+                  print(f"Sending to Gemini: '{issue_body_text}'")
+                  response = model.generate_content(issue_body_text)
+                  
+                  if hasattr(response, 'text') and response.text is not None:
+                      file_content_to_write = response.text
+                  elif response.candidates and response.candidates[0].content.parts[0].text:
+                       file_content_to_write = response.candidates[0].content.parts[0].text
+                  else:
+                      error_message = "Error: Could not extract text from Gemini response."
+                      print(error_message)
+                      print("Full response:", response) # Log the full response for debugging
+                      file_content_to_write = error_message + "\nFull response:\n" + str(response)
 
-          try:
-              genai.configure(api_key=api_key)
-              # Using "gemini-1.5-flash-latest". 
-              # If "gemini-2.5-flash-preview-05-20" is a valid model you have access to, use that string instead.
-              model = genai.GenerativeModel(model_name="gemini-2.5-flash-preview-05-20") 
-              
-              print(f"Sending to Gemini: '{issue_body_text}'")
-              response = model.generate_content(issue_body_text)
-              
-              # Check if response has text attribute and candidates
-              if hasattr(response, 'text') and response.text is not None:
-                  gemini_text_output = response.text
-              elif response.candidates and response.candidates[0].content.parts[0].text:
-                   gemini_text_output = response.candidates[0].content.parts[0].text
-              else:
-                  gemini_text_output = "Error: Could not extract text from Gemini response. Full response: " + str(response)
-                  print(gemini_text_output)
-
-
-          except Exception as e:
-              print(f"Error calling Gemini API: {e}")
-              gemini_text_output = f"Error during Gemini API call: {str(e)}"
-              # Create an output file with the error
-              with open(output_filename, "w", encoding="utf-8") as f:
-                  f.write(gemini_text_output)
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-                  print(f'output_file={output_filename}', file=fh)
-              # Decide if this API error should cause the job to fail (exit 1) or just log (exit 0)
-              # Let's have it create the error file and exit successfully for now.
-              exit(0) 
-
-
-          print(f"Gemini Output (first 100 chars): {gemini_text_output[:100]}")
-
-          with open(output_filename, "w", encoding="utf-8") as f:
-              f.write(gemini_text_output)
+              except Exception as e:
+                  print(f"Error calling Gemini API: {e}")
+                  file_content_to_write = f"Error during Gemini API call: {str(e)}"
           
-          print(f"Output saved to {output_filename}")
+          print(f"Content for file (first 100 chars): {file_content_to_write[:100]}")
+
+          # Always write the file, even if it's an error message
+          with open(output_filename, "w", encoding="utf-8") as f:
+              f.write(file_content_to_write)
+          
+          print(f"Content saved to local file: {output_filename}")
           
           # Set the output filename for the next step
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
@@ -109,27 +105,20 @@ jobs:
 
           python gemini_processor.py
 
-      - name: Commit and Push Output File
-        if: steps.gemini_script.outputs.output_file != '' # Only run if output_file was set
-        run: |
-          output_file_to_commit="${{ steps.gemini_script.outputs.output_file }}"
-          echo "Attempting to commit: $output_file_to_commit"
-          
-          if [ ! -f "$output_file_to_commit" ]; then
-            echo "Output file '$output_file_to_commit' not found. Skipping commit."
-            exit 0
-          fi
+      - name: Upload Gemini Output to OneDrive
+        # Only run if the python script actually produced an output_file name
+        if: steps.gemini_script.outputs.output_file != ''
+        uses: jef/ms-graph-upload-action@v2.0.0
+        with:
+          CLIENT_ID: ${{ env.MS_CLIENT_ID }}
+          CLIENT_SECRET: ${{ env.MS_CLIENT_SECRET }}
+          TENANT_ID: ${{ env.MS_TENANT_ID }}
+          USER_PRINCIPAL_NAME: ${{ env.MS_USER_PRINCIPAL_NAME }}
+          TARGET_FOLDER: ${{ env.ONEDRIVE_GEMINI_FOLDER }} # e.g. /gemini_output
+          FILE_PATH: ${{ steps.gemini_script.outputs.output_file }} # The file generated by python script
+          CONFLICT_BEHAVIOR: 'replace' # Options: 'replace', 'rename', 'fail' (default)
+          # RENAME_FILE: # Optional: if you want to rename it on OneDrive, otherwise uses original name
 
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add "$output_file_to_commit"
-          
-          # Check if there are changes to commit for the specific file
-          if git diff --staged --quiet -- "$output_file_to_commit"; then
-            echo "No changes to commit for $output_file_to_commit."
-          else
-            git commit -m "Add Gemini output for Issue #${{ github.event.issue.number }} (${output_file_to_commit})"
-            git push
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The "Commit and Push Output File" step has been removed
+      # - name: Commit and Push Output File
+      #   ...

@@ -60,7 +60,7 @@ jobs:
           try:
               # Corrected Gemini API call based on your example
               genai.configure(api_key=api_key) # Configure the client with the key
-              model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest") # Or your preferred model like "gemini-pro"
+              model = genai.GenerativeModel(model_name="gemini-2.5-flash-preview-05-20") # Or your preferred model like "gemini-pro"
               
               print(f"Sending to Gemini: {issue_body_text}")
               response = model.generate_content(issue_body_text)

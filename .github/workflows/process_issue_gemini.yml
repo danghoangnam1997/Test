@@ -1,25 +1,15 @@
-name: Process New Issue with Gemini and Upload to OneDrive (Manual API)
+name: Process Issue with Gemini and Update
 
 on:
   issues:
     types: [opened]
-  workflow_dispatch:
 
 jobs:
-  run_gemini_and_upload_to_onedrive:
+  process_and_update_issue:
     runs-on: ubuntu-latest
     permissions:
-      issues: read # To read the issue body
-
-    env:
-      # OneDrive Secrets - ensure these are set in your repository secrets
-      MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
-      MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
-      MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
-      MS_USER_PRINCIPAL_NAME: ${{ secrets.MS_USER_PRINCIPAL_NAME }} # User whose OneDrive to use
-      # Define just the target folder name. Path construction will handle the rest.
-      # The API call will place it under the 'root' of the drive.
-      ONEDRIVE_TARGET_FOLDER_NAME: 'gemini_output'
+      issues: write # Required to update issue body and assignees
+      contents: read # Default, good to have if script ever needed to read repo files
 
     steps:
       - name: Checkout repository
@@ -28,12 +18,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.x' # Or a specific version like '3.10'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-generativeai
+      - name: Install Python dependencies
+        run: pip install google-generativeai
 
       - name: Run Gemini on Issue Body
         id: gemini_script
@@ -45,24 +33,19 @@ jobs:
           cat << EOF > gemini_processor.py
           import os
           import google.generativeai as genai
-
           api_key = os.environ.get("GEMINI_API_KEY")
           issue_body_text = os.environ.get("ISSUE_BODY", "") # Default to empty string
           issue_number = os.environ.get("ISSUE_NUMBER")
-
           # Corrected f-string syntax here
           output_filename = f"gemini_output_issue_{issue_number}.txt"
-
           print(f"Processing Issue #{issue_number}")
           print(f"Output filename will be: {output_filename}")
-
           if not api_key:
               print("Error: GEMINI_API_KEY not found.")
               # Write empty output_file to GITHUB_OUTPUT to signal no file to process
               with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
                   print(f'output_file=', file=fh)
               exit(1) # Fail the step if API key is missing
-
           file_content_to_write = ""
           if not issue_body_text.strip():
               print("Warning: Issue body is empty or only whitespace.")
@@ -74,7 +57,11 @@ jobs:
                   model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest")
                   
                   print(f"Sending to Gemini (first 100 chars): '{issue_body_text[:100]}'")
-                  response = model.generate_content(issue_body_text)
+                  # Construct a proper prompt if needed, e.g., to summarize or rephrase
+                  # For now, sending the raw body as per the script
+                  prompt_for_gemini = f"Please process the following issue body:\n\n{issue_body_text}"
+
+                  response = model.generate_content(prompt_for_gemini) # Use the constructed prompt
                   
                   if hasattr(response, 'text') and response.text is not None:
                       file_content_to_write = response.text
@@ -84,15 +71,13 @@ jobs:
                       error_message = "Error: Could not extract text from Gemini response."
                       print(error_message)
                       # Log the full response for debugging if possible
-                      # print("Full response:", response)
+                      # print("Full response:", response) # Be careful with logging sensitive data
                       file_content_to_write = error_message + "\nFull response logged to actions console if possible."
-
               except Exception as e:
                   print(f"Error calling Gemini API: {e}")
                   file_content_to_write = f"Error during Gemini API call: {str(e)}"
           
           print(f"Content for file (first 100 chars): {file_content_to_write[:100]}")
-
           with open(output_filename, "w", encoding="utf-8") as f:
               f.write(file_content_to_write)
           
@@ -103,86 +88,72 @@ jobs:
           EOF
           python gemini_processor.py
 
-      - name: Upload Gemini Output to OneDrive via MS Graph API
-        # Only run if the python script produced an output_file and secrets are present
-        if: steps.gemini_script.outputs.output_file != '' && env.MS_CLIENT_ID != '' && env.MS_CLIENT_SECRET != '' && env.MS_TENANT_ID != '' && env.MS_USER_PRINCIPAL_NAME != ''
-        env:
-          LOCAL_FILE_TO_UPLOAD: ${{ steps.gemini_script.outputs.output_file }}
+      - name: Read Gemini Output File Content
+        id: read_gemini_output
+        # Only run if the previous step succeeded and produced an output file
+        if: steps.gemini_script.outputs.output_file != ''
         run: |
-          echo "Attempting to upload '$LOCAL_FILE_TO_UPLOAD' to OneDrive folder '$ONEDRIVE_TARGET_FOLDER_NAME'"
+          output_file_name="${{ steps.gemini_script.outputs.output_file }}"
+          echo "Reading content from $output_file_name"
+          file_content=$(cat "$output_file_name")
+          # Make the content available to subsequent steps
+          # Using heredoc for multiline output: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
+          echo "gemini_response<<EOF" >> $GITHUB_OUTPUT
+          echo "$file_content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "Gemini response content read and set as output."
 
-          if [ ! -f "$LOCAL_FILE_TO_UPLOAD" ]; then
-            echo "Error: File '$LOCAL_FILE_TO_UPLOAD' not found for upload."
-            exit 1
-          fi
+      - name: Update Issue Body with Gemini Output
+        # Only run if the gemini_script produced an output file and read_gemini_output successfully read it.
+        if: steps.gemini_script.outputs.output_file != '' && steps.read_gemini_output.outputs.gemini_response != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue_number = ${{ github.event.issue.number }};
+            const new_body = `${{ steps.read_gemini_output.outputs.gemini_response }}`;
 
-          # Step 1: Acquire Access Token from Microsoft Identity Platform
-          echo "Acquiring Access Token..."
-          TOKEN_RESPONSE=$(curl -s -X POST "https://login.microsoftonline.com/$MS_TENANT_ID/oauth2/v2.0/token" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "client_id=$MS_CLIENT_ID" \
-            -d "client_secret=$MS_CLIENT_SECRET" \
-            -d "scope=https://graph.microsoft.com/.default" \
-            -d "grant_type=client_credentials")
+            // You could add a header or footer if you want, e.g.:
+            // const final_body = `**Gemini Processed Output:**\n\n${new_body}\n\n---\n*Original issue processed by Gemini Action*`;
+            const final_body = new_body; // Overwrites completely
 
-          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
+            console.log(`Updating issue #${issue_number} with new body.`);
+            try {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue_number,
+                body: final_body
+              });
+              console.log("Issue body updated successfully.");
+            } catch (error) {
+              console.error("Failed to update issue body:", error);
+              core.setFailed(`Failed to update issue body: ${error.message}`);
+            }
 
-          if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
-            echo "Error: Failed to acquire Access Token."
-            echo "Token Response: $TOKEN_RESPONSE"
-            exit 1
-          fi
-          echo "Access Token acquired successfully."
+      - name: Assign Issue
+        # This step will run regardless of the Gemini processing outcome,
+        # as long as the job hasn't failed before this point.
+        # If you only want to assign on successful Gemini processing, add an if condition:
+        # if: success() && steps.gemini_script.outputs.output_file != '' && steps.read_gemini_output.outputs.gemini_response != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue_number = ${{ github.event.issue.number }};
+            const assignee = "danghoangnam1997";
 
-          # Step 2: Construct the Upload URL
-          # Path segment for the folder. If ONEDRIVE_TARGET_FOLDER_NAME is empty, it uploads to drive root.
-          # Otherwise, it uploads to /root:/folder_name/filename.txt
-          # The API requires the item path to start with 'root:' if addressing by path from the root.
-          # For example: /users/{upn}/drive/root:/MyFolder/MyFile.txt:/content
-          
-          FILENAME_ONLY=$(basename "$LOCAL_FILE_TO_UPLOAD")
-          
-          # URL encode the filename (e.g., spaces to %20) - Python is already available
-          ENCODED_FILENAME=$(python -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "$FILENAME_ONLY")
-
-          # Construct path: if folder name is empty, target root. Otherwise, target folder in root.
-          if [ -z "$ONEDRIVE_TARGET_FOLDER_NAME" ]; then
-            # Upload to drive root
-            UPLOAD_API_PATH="root:/$ENCODED_FILENAME"
-          else
-            # Clean potential leading/trailing slashes from folder name for robust path construction
-            CLEANED_FOLDER_NAME=$(echo "$ONEDRIVE_TARGET_FOLDER_NAME" | sed 's#^/*##;s#/*$##')
-            UPLOAD_API_PATH="root:/$CLEANED_FOLDER_NAME/$ENCODED_FILENAME"
-          fi
-          
-          UPLOAD_URL="https://graph.microsoft.com/v1.0/users/$MS_USER_PRINCIPAL_NAME/drive/$UPLOAD_API_PATH:/content"
-          
-          echo "Upload URL: $UPLOAD_URL"
-
-          # Step 3: Upload the file using PUT request
-          echo "Uploading '$LOCAL_FILE_TO_UPLOAD' to OneDrive..."
-          # The --data-binary "@filename" reads the content from the file.
-          # -w "%{http_code}" writes the HTTP status code to stdout
-          # -o upload_api_response.txt saves the body of the API response to a file
-          HTTP_STATUS_CODE=$(curl -s -L -X PUT "$UPLOAD_URL" \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            -H "Content-Type: text/plain" \
-            --data-binary "@$LOCAL_FILE_TO_UPLOAD" \
-            -w "%{http_code}" -o upload_api_response.txt)
-          
-          API_RESPONSE_BODY=$(cat upload_api_response.txt)
-
-          if [ "$HTTP_STATUS_CODE" -ge 200 ] && [ "$HTTP_STATUS_CODE" -lt 300 ]; then
-            echo "File uploaded successfully to OneDrive. Status: $HTTP_STATUS_CODE"
-            echo "OneDrive API Response: $API_RESPONSE_BODY"
-          else
-            echo "Error: Failed to upload file to OneDrive. HTTP Status: $HTTP_STATUS_CODE"
-            echo "OneDrive API Response: $API_RESPONSE_BODY"
-            # For 401/403, it's often a permission or token issue.
-            if [ "$HTTP_STATUS_CODE" == "401" ] || [ "$HTTP_STATUS_CODE" == "403" ]; then
-                echo "Check Azure AD App permissions (e.g., Files.ReadWrite.All) and token generation."
-            elif [ "$HTTP_STATUS_CODE" == "404" ]; then
-                echo "Check if the UPN ($MS_USER_PRINCIPAL_NAME) is correct or if the drive/folder path is valid."
-            fi
-            exit 1
-          fi
+            console.log(`Assigning issue #${issue_number} to ${assignee}.`);
+            try {
+              await github.rest.issues.addAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue_number,
+                assignees: [assignee]
+              });
+              console.log(`Issue #${issue_number} assigned to ${assignee}.`);
+            } catch (error) {
+              console.error(`Failed to assign issue #${issue_number} to ${assignee}:`, error);
+              // Decide if this should fail the step or just log
+              // core.setFailed(`Failed to assign issue: ${error.message}`);
+            }

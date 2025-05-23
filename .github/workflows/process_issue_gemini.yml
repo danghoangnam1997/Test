@@ -54,12 +54,12 @@ jobs:
               try:
                   genai.configure(api_key=api_key)
                   # Using a common flash model. Adjust if needed.
-                  model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest")
+                  model = genai.GenerativeModel(model_name="gemini-2.5-flash-preview-05-20")
                   
                   print(f"Sending to Gemini (first 100 chars): '{issue_body_text[:100]}'")
                   # Construct a proper prompt if needed, e.g., to summarize or rephrase
                   # For now, sending the raw body as per the script
-                  prompt_for_gemini = f"Please process the following issue body:\n\n{issue_body_text}"
+                  prompt_for_gemini = f"{issue_body_text}"
 
                   response = model.generate_content(prompt_for_gemini) # Use the constructed prompt
                   
